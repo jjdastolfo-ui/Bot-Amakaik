@@ -10,6 +10,16 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+
+// ── CONCEPTOS NO OPERATIVOS ──────────────────────────────────────────────────
+// Movimientos que afectan la caja pero NO son gasto del negocio: distribución
+// de resultado y movimientos de capital. Sumarlos al gasto infla el costo del
+// ejercicio y distorsiona la comparación contra el presupuesto.
+const NO_OPERATIVOS = ['DIVIDENDOS', 'RETIRO SOCIOS', 'RETIRO DE SOCIOS',
+                       'APORTE SOCIOS', 'APORTE DE SOCIOS', 'DISTRIBUCION UTILIDADES'];
+const SQL_NO_OPERATIVOS = NO_OPERATIVOS.map(c => `'${c}'`).join(',');
+const FILTRO_OPERATIVO = `upper(COALESCE(concepto,'')) NOT IN (${SQL_NO_OPERATIVOS})`;
+
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -533,11 +543,11 @@ function getInformeCiclo(cicloStr, tipo = 'productivo') {
 
   const rows = db.prepare(`
     SELECT concepto, 
-           SUM(egreso) as total_egreso, 
+           SUM(egreso) as total_egreso,
            SUM(ingreso) as total_ingreso,
            COUNT(*) as cant_movimientos
-    FROM transacciones 
-    WHERE fecha >= ? AND fecha <= ?
+    FROM transacciones
+    WHERE fecha >= ? AND fecha <= ? AND ${FILTRO_OPERATIVO}
     GROUP BY concepto ORDER BY total_egreso DESC
   `).all(ciclo.fecha_desde, fechaHasta);
 
@@ -559,10 +569,10 @@ function getInformeMensual(anio, mes) {
   const periodo = `${anio}-${String(mes).padStart(2, '0')}`;
   const rows = db.prepare(`
     SELECT concepto, 
-           SUM(egreso) as total_egreso, 
+           SUM(egreso) as total_egreso,
            SUM(ingreso) as total_ingreso,
            COUNT(*) as cant
-    FROM transacciones WHERE fecha LIKE ?
+    FROM transacciones WHERE fecha LIKE ? AND ${FILTRO_OPERATIVO}
     GROUP BY concepto ORDER BY total_egreso DESC
   `).all(`${periodo}-%`);
 
@@ -655,6 +665,13 @@ const DB_SCHEMA = `Base SQLite de AMAKAIK. Montos en USD. El ciclo ganadero va d
 - stock_productos(id, nombre, categoria, unidad, cantidad [=stock actual], precio_unitario [=costo promedio])
 - stock_movimientos(id, producto_id, fecha, tipo 'ENTRADA'/'SALIDA'/'AJUSTE', cantidad, precio_unitario)
 - presupuestos(id, ciclo, concepto, monto_anual)
+
+GASTO OPERATIVO vs NO OPERATIVO: los conceptos DIVIDENDOS, RETIRO SOCIOS y APORTE
+SOCIOS son distribución de resultado o movimientos de capital: afectan la caja pero
+NO son gasto del negocio. Al informar gastos, costos del ejercicio o comparar contra
+el presupuesto, EXCLUÍLOS. Si te preguntan por el flujo de caja o el saldo, ahí sí
+van incluidos. Cuando muestres un total de gastos, podés aclarar aparte cuánto se
+retiró en dividendos.
 - diario_campo(id, campo, fecha, tipo 'LLUVIA'/'ACONTECIMIENTO', mm, titulo, detalle). El registro pluviométrico y el diario del campo: las lluvias son las filas con tipo='LLUVIA' y los milímetros están en mm. Para acumulados usá SUM(mm) filtrando por fecha (ej: lo que va del mes = WHERE tipo='LLUVIA' AND substr(fecha,1,7)='2026-08'). SIEMPRE respondé las preguntas de lluvia consultando esta tabla; nunca digas que no manejás datos de lluvia.
 - tareas_campo(id, campo, texto, estado 'PENDIENTE'/'HECHA', fecha)
 Insumos faltantes de un año = por cada orden_items con tipo='INSUMO', ejecutado=0 y producto_id, sumar cantidad por producto y restar stock_productos.cantidad.`;
@@ -696,9 +713,9 @@ async function buildContexto() {
   // Resumen de egresos del mes actual
   const mesActual = new Date().toISOString().slice(0, 7);
   const egresosMes = db.prepare(`
-    SELECT concepto, SUM(egreso) as total 
-    FROM transacciones 
-    WHERE fecha LIKE ? AND egreso > 0
+    SELECT concepto, SUM(egreso) as total
+    FROM transacciones
+    WHERE fecha LIKE ? AND egreso > 0 AND ${FILTRO_OPERATIVO}
     GROUP BY concepto ORDER BY total DESC LIMIT 10
   `).all(`${mesActual}-%`);
 
@@ -1257,7 +1274,7 @@ async function ejecutarAccion(accion) {
     const periodo = accion.periodo || new Date().toISOString().slice(0, 7);
     const rows = db.prepare(`
       SELECT concepto, SUM(egreso) as total_egreso, SUM(ingreso) as total_ingreso
-      FROM transacciones WHERE fecha LIKE ?
+      FROM transacciones WHERE fecha LIKE ? AND ${FILTRO_OPERATIVO}
       GROUP BY concepto ORDER BY total_egreso DESC
     `).all(`${periodo}-%`);
 
@@ -1278,7 +1295,7 @@ async function ejecutarAccion(accion) {
 
     const rows = db.prepare(`
       SELECT concepto, SUM(egreso) as total_egreso, SUM(ingreso) as total_ingreso
-      FROM transacciones WHERE fecha BETWEEN ? AND ?
+      FROM transacciones WHERE fecha BETWEEN ? AND ? AND ${FILTRO_OPERATIVO}
       GROUP BY concepto ORDER BY total_egreso DESC
     `).all(fecha_desde, fecha_hasta);
 
@@ -3468,6 +3485,28 @@ app.post("/api/stock/compra", (req, res) => {
 });
 
 // LISTA de productos de stock (para que ADE elija al aplicar sanidad)
+
+// Los retiros y aportes de socios se informan aparte del gasto operativo.
+function movimientosNoOperativos(desde, hasta) {
+  const filas = db.prepare(`
+    SELECT concepto, SUM(egreso) AS egreso, SUM(ingreso) AS ingreso, COUNT(*) AS n
+    FROM transacciones
+    WHERE fecha >= ? AND fecha <= ? AND upper(COALESCE(concepto,'')) IN (${SQL_NO_OPERATIVOS})
+    GROUP BY concepto ORDER BY egreso DESC`).all(desde, hasta);
+  return {
+    detalle: filas,
+    retirado: filas.reduce((a, f) => a + (f.egreso || 0), 0),
+    aportado: filas.reduce((a, f) => a + (f.ingreso || 0), 0)
+  };
+}
+
+app.get("/api/no-operativos", (req, res) => {
+  const desde = req.query.desde || `${new Date().getFullYear()}-01-01`;
+  const hasta = req.query.hasta || new Date().toISOString().slice(0, 10);
+  try { res.json(movimientosNoOperativos(desde, hasta)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/api/stock/lista", (req, res) => {
   const campo = req.query.campo;
   const rubro = req.query.rubro;
